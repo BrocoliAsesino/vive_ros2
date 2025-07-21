@@ -54,24 +54,24 @@ cp libraries/openvr/samples/bin/cube_texture.png libraries/openvr/samples/bin/he
 1. Clone the repository.
     ```bash
     # here I use ~/vive_ws as the ROS2 workspace, you can change it to your own workspace
-    mkdir -p ~/vive_ws/src && cd ~/vive_ws/src
+    mkdir -p /vive_ws/src && cd /vive_ws/src
     git clone https://github.com/iltlo/vive_ros2.git
     ```
 2. Build the package.
     ```bash
-    cd ~/vive_ws
+    cd /vive_ws
     colcon build --packages-select vive_ros2
     source install/setup.bash
     ```
 3.  Set the environment variables.
     ```bash
     # for bash shell
-    echo 'alias setup_vive="source ~/vive_ws/src/vive_ros2/scripts/set_vr_env.sh && source ~/vive_ws/install/setup.bash"' >> ~/.bashrc
+    echo 'alias setup_vive="source ~/git/STEAM_ws/vive_ros2/scripts/set_vr_env.sh && source ~/git/STEAM_ws/vive_ros2/install/setup.bash"' >> ~/.bashrc
     source ~/.bashrc
     ```
     ```bash
     # for zsh shell
-    echo 'alias setup_vive="source ~/vive_ws/src/vive_ros2/scripts/set_vr_env.sh && source ~/vive_ws/install/setup.zsh"' >> ~/.zshrc
+    echo 'alias setup_vive="source ~/git/STEAM_ws/vive_ros2/scripts/set_vr_env.sh && source ~/git/STEAM_ws/vive_ros2/install/setup.zsh"' >> ~/.zshrc
     source ~/.zshrc
     ```
 4. Start SteamVR.
