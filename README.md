@@ -80,6 +80,9 @@ cp libraries/openvr/samples/bin/cube_texture.png libraries/openvr/samples/bin/he
     ```
 5. Run the package.
     ```bash
+    # temporary for this shell
+    export LD_LIBRARY_PATH=$HOME/libraries/openvr/bin/linux64:$LD_LIBRARY_PATH
+    # permanent: append the same line to ~/.bashrc **after** sourcing ROS2
     # Terminal 1:
     ros2 run vive_ros2 vive_input
     # Terminal 2:
