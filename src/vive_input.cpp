@@ -7,6 +7,31 @@
 #include "json.hpp" // Include nlohmann/json
 #include "server.hpp"
 
+
+// Forward declaration for VRTrackerData
+// This struct will hold the pose and velocity data for a generic tracker
+struct VRTrackerData {
+    long long time;
+    uint32_t device_index; // Use uint32_t for device index as per OpenVR
+    Eigen::Vector3d position;
+    Eigen::Quaterniond quaternion;
+    Eigen::Vector3d linear_velocity;
+    Eigen::Vector3d angular_velocity;
+    bool pose_is_valid;
+    bool device_is_connected;
+
+    // Helper to reset data
+    void reset() {
+        time = 0;
+        device_index = vr::k_unTrackedDeviceIndexInvalid; // Use OpenVR's invalid index
+        position.setZero();
+        quaternion.setIdentity();
+        linear_velocity.setZero();
+        angular_velocity.setZero();
+        pose_is_valid = false;
+        device_is_connected = false;
+    }
+};
 // VR Input Configuration Constants
 namespace VRInputConfig {
     constexpr double DEFAULT_PUBLISH_FREQUENCY = 50.0;
@@ -28,6 +53,7 @@ namespace VRInputConfig {
     constexpr int RIGHT_CONTROLLER_INDEX = 0;
     constexpr int LEFT_CONTROLLER_INDEX = 1;
     constexpr int MAX_CONTROLLERS = 2;
+    constexpr int ROLE_TRACKER0 = 2;
 }
 
 // VR Controller Input Handler - manages VR device detection and data processing
@@ -47,7 +73,7 @@ private:
     std::mutex &data_mutex;
     std::condition_variable &data_cv;
     VRControllerData &shared_data;
-    VRControllerData local_data;
+    VRControllerData local_controller_data;
     
     // Track both controllers separately (right = 0, left = 1)
     bool controller_detected[VRInputConfig::MAX_CONTROLLERS] = {false, false};
@@ -66,12 +92,28 @@ private:
     std::chrono::steady_clock::time_point last_publish_time[VRInputConfig::MAX_CONTROLLERS]; // For each controller
     bool publish_time_initialized[VRInputConfig::MAX_CONTROLLERS] = {false, false};
 
+    // --- New members for HTC Vive Trackers ---
+    std::vector<VRTrackerData> tracker_data;
+    std::vector<bool> tracker_detected;
+    std::vector<Eigen::Vector3d> prev_tracker_position;
+    std::vector<std::chrono::steady_clock::time_point> prev_tracker_time;
+    std::vector<bool> first_tracker_run;
+    std::vector<bool> tracker_updated;
+    std::vector<std::chrono::steady_clock::time_point> last_tracker_publish_time;
+    std::vector<bool> tracker_publish_time_initialized;
+    // --- End new members ---
+
     bool initVR();
     bool shutdownVR();
     void processControllerData(uint32_t deviceIndex, int roleIndex);
     void processControllerButtons(uint32_t deviceIndex, vr::VRControllerState_t& controllerState, int roleIndex);
     void processTriggerFeedback(float triggerValue, uint32_t deviceIndex, int roleIndex);
-    bool validatePositionChange(const Eigen::Vector3d& currentPosition, int roleIndex);
+    // bool validatePositionChange(const Eigen::Vector3d& currentPosition, int roleIndex);
+    // Generalized position validation method
+    bool validatePositionChange(const Eigen::Vector3d& currentPosition, uint32_t deviceIndex, bool isController);
+    // New method for processing tracker data
+    void processTrackerData(uint32_t deviceIndex);
+
     void publishControllerDataAtFrequency();
     void handleControllerDetection(bool anyControllerDetected, std::chrono::steady_clock::time_point currentTime, std::chrono::steady_clock::time_point& lastLogTime);
 };
@@ -81,6 +123,22 @@ ViveInput::ViveInput(std::mutex &mutex, std::condition_variable &cv, VRControlle
     if (!initVR()) {
         shutdownVR();
         throw std::runtime_error("Failed to initialize VR");
+    }
+
+    // Initialize tracker-specific vectors to max possible device count
+    tracker_data.resize(vr::k_unMaxTrackedDeviceCount);
+    tracker_detected.resize(vr::k_unMaxTrackedDeviceCount, false);
+    prev_tracker_position.resize(vr::k_unMaxTrackedDeviceCount);
+    prev_tracker_time.resize(vr::k_unMaxTrackedDeviceCount);
+    first_tracker_run.resize(vr::k_unMaxTrackedDeviceCount, true);
+    tracker_updated.resize(vr::k_unMaxTrackedDeviceCount, false);
+    last_tracker_publish_time.resize(vr::k_unMaxTrackedDeviceCount);
+    tracker_publish_time_initialized.resize(vr::k_unMaxTrackedDeviceCount, false);
+
+    // Reset initial states for all potential trackers
+    for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+        tracker_data[i].reset();
+        prev_tracker_position[i].setZero(); // Initialize Eigen vectors
     }
 }
 
@@ -96,6 +154,11 @@ void ViveInput::setPublishFrequency(double freq) {
         // Reset timing for both controllers to apply new frequency immediately
         publish_time_initialized[VRInputConfig::RIGHT_CONTROLLER_INDEX] = false;
         publish_time_initialized[VRInputConfig::LEFT_CONTROLLER_INDEX] = false;
+
+        // Reset timing for all trackers as well
+        for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+            tracker_publish_time_initialized[i] = false;
+        }
     } else {
         logMessage(Warning, "Invalid frequency: " + std::to_string(freq) + " Hz. Must be between " + 
                    std::to_string(VRInputConfig::MIN_PUBLISH_FREQUENCY) + " and " + 
@@ -115,6 +178,11 @@ void ViveInput::runVR() {
         // Reset controller detection status for this loop
         controller_detected[0] = false; // Right controller
         controller_detected[1] = false; // Left controller
+
+        for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+            tracker_detected[i] = false;
+            tracker_updated[i] = false; // Reset tracker update flags
+        }
         
         // Reset controller update flags for this iteration
         right_controller_updated = false;
@@ -128,10 +196,17 @@ void ViveInput::runVR() {
             if (trackedDevicePose[i].bDeviceIsConnected && trackedDevicePose[i].bPoseIsValid
                 && trackedDevicePose[i].eTrackingResult == vr::TrackingResult_Running_OK) {
 
-                if (VRUtils::controllerIsConnected(pHMD, i)) {
+                vr::ETrackedDeviceClass trackedDeviceClass = pHMD->GetTrackedDeviceClass(i); 
+
+
+                // if (VRUtils::controllerIsConnected(pHMD, i)) {
+                //     // Get the controller's role (left or right)
+                //     vr::ETrackedControllerRole controllerRole = VRUtils::controllerRoleCheck(pHMD, i);
+                if (trackedDeviceClass == vr::ETrackedDeviceClass::TrackedDeviceClass_Controller) {
+                    // This is a controller (e.g., Vive Wand)
                     // Get the controller's role (left or right)
-                    vr::ETrackedControllerRole controllerRole = VRUtils::controllerRoleCheck(pHMD, i);
-                    
+                    vr::ETrackedControllerRole controllerRole = pHMD->GetControllerRoleForTrackedDeviceIndex(i);
+
                     // Process only if it's a valid controller (left or right hand)
                     if (controllerRole == vr::TrackedControllerRole_LeftHand || 
                         controllerRole == vr::TrackedControllerRole_RightHand) {
@@ -156,13 +231,13 @@ void ViveInput::runVR() {
                                 std::to_string(position.z() * 100));
                         
                         // Reset local data for this controller
-                        VRUtils::resetJsonData(local_data);
+                        VRUtils::resetJsonData(local_controller_data);
                         
                         // Store controller data using new Eigen-based methods
-                        local_data.time = Server::getCurrentTimeWithMilliseconds();
-                        local_data.role = role_index; // 0 = right, 1 = left
-                        local_data.setPosition(position - Eigen::Vector3d(0, VRInputConfig::Y_OFFSET, 0)); // Apply Y offset
-                        local_data.setQuaternion(quaternion);
+                        local_controller_data.time = Server::getCurrentTimeWithMilliseconds();
+                        local_controller_data.role = role_index; // 0 = right, 1 = left
+                        local_controller_data.setPosition(position - Eigen::Vector3d(0, VRInputConfig::Y_OFFSET, 0)); // Apply Y offset
+                        local_controller_data.setQuaternion(quaternion);
 
                         // Process controller state and buttons
                         vr::VRControllerState_t controllerState;
@@ -171,31 +246,31 @@ void ViveInput::runVR() {
                         if ((1LL << vr::k_EButton_ApplicationMenu) & controllerState.ulButtonPressed) {
                             logMessage(Debug, "Application Menu button pressed, resetting the pose");
                             first_run[role_index] = true; // Reset the first run flag for this controller
-                            local_data.menu_button = true;
+                            local_controller_data.menu_button = true;
                             VRUtils::HapticFeedback(pHMD, i, 200);
                         }
                         
                         if ((1LL << vr::k_EButton_SteamVR_Trigger) & controllerState.ulButtonPressed) {
                             logMessage(Debug, "Trigger button pressed");
-                            local_data.trigger_button = true;
+                            local_controller_data.trigger_button = true;
                         }
                         
                         if ((1LL << vr::k_EButton_SteamVR_Touchpad) & controllerState.ulButtonPressed) {
                             logMessage(Debug, "Touchpad button pressed");
-                            local_data.trackpad_button = true;
+                            local_controller_data.trackpad_button = true;
                             VRUtils::HapticFeedback(pHMD, i, 200);
                         }
                         
                         if ((1LL << vr::k_EButton_Grip) & controllerState.ulButtonPressed) {
                             logMessage(Debug, "Grip button pressed");
-                            local_data.grip_button = true;
+                            local_controller_data.grip_button = true;
                         }
                         
                         if ((1LL << vr::k_EButton_SteamVR_Touchpad) & controllerState.ulButtonTouched) {
                             logMessage(Debug, "Touchpad button touched");
-                            local_data.trackpad_x = controllerState.rAxis[0].x;
-                            local_data.trackpad_y = controllerState.rAxis[0].y;
-                            local_data.trackpad_touch = true;
+                            local_controller_data.trackpad_x = controllerState.rAxis[0].x;
+                            local_controller_data.trackpad_y = controllerState.rAxis[0].y;
+                            local_controller_data.trackpad_touch = true;
                         }
                         
                         // Process trigger
@@ -204,7 +279,7 @@ void ViveInput::runVR() {
                         float triggerValue = controllerState.rAxis[1].x;
                         int currentStep = static_cast<int>(triggerValue / stepSize);
                         logMessage(Debug, "Trigger: " + std::to_string(triggerValue) + "\n");
-                        local_data.trigger = triggerValue;
+                        local_controller_data.trigger = triggerValue;
                         
                         if (currentStep != previousStep[role_index]) {
                             int vibrationDuration = static_cast<int>(triggerValue * 3000);
@@ -249,12 +324,17 @@ void ViveInput::runVR() {
                         // Store this controller's data - we'll send both controllers at the end of the loop
                         // Create a copy of the current controller data
                         if (role_index == 0) { // Right controller
-                            right_controller_data = local_data;
+                            right_controller_data = local_controller_data;
                             right_controller_updated = true;
                         } else { // Left controller
-                            left_controller_data = local_data;
+                            left_controller_data = local_controller_data;
                             left_controller_updated = true;
                         }
+                    }
+                    else if (trackedDeviceClass == vr::ETrackedDeviceClass::TrackedDeviceClass_GenericTracker) {
+                        // This is a generic tracker (e.g., HTC Vive Tracker 3.0)
+                        processTrackerData(i); // Process tracker data
+                        tracker_detected[i] = true; // Mark this tracker as detected
                     }
                 }
             }
@@ -264,6 +344,13 @@ void ViveInput::runVR() {
         // This ensures both controllers are sent at the same configurable rate
         auto currentTime = std::chrono::steady_clock::now();
         bool anyControllerDetected = controller_detected[0] || controller_detected[1];
+        bool anyTrackerDetected = false;
+        for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+            if (tracker_detected[i]) {
+                anyTrackerDetected = true;
+                break;
+            }
+        }
         
         // Calculate time interval for desired frequency
         double interval_ms = 1000.0 / controllerPublishFrequency;
@@ -310,20 +397,56 @@ void ViveInput::runVR() {
                 }
             }
         }
+
+        // --- New: Process and send tracker data at controlled frequency ---
+        // Note: The current `shared_data` (VRControllerData) and `Server` class are designed for controllers.
+        // To publish tracker data to the ROS2 client, you will need to:
+        // 1. Extend `VRControllerData` to be a more generic `VRDeviceData` (e.g., using a `std::variant` or `enum` to differentiate device types).
+        // 2. Modify the `Server` class to handle and serialize `VRTrackerData` (or the generalized `VRDeviceData`).
+        // 3. Update the Python client (`vive_node`) to deserialize and publish `VRTrackerData` to new ROS2 topics (e.g., `/vive_tracker_X/pose`).
+        // For now, the tracker data is processed and stored internally in `tracker_data` vector.
+        for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+            if (tracker_updated[i]) {
+                // Initialize publish time if not done yet
+                if (!tracker_publish_time_initialized[i]) {
+                    last_tracker_publish_time[i] = currentTime;
+                    tracker_publish_time_initialized[i] = true;
+                }
+                
+                // Check if enough time has passed for this tracker
+                auto time_since_last_publish = currentTime - last_tracker_publish_time[i];
+                if (time_since_last_publish >= interval_duration) {
+                    // In a real scenario, you would send `tracker_data[i]` to the server here.
+                    // For demonstration, we'll just log it.
+                    logMessage(Info, " Tracker data ready for publishing. "
+                               "Position: (" + std::to_string(tracker_data[i].position.x()) + ", " +
+                               std::to_string(tracker_data[i].position.y()) + ", " +
+                               std::to_string(tracker_data[i].position.z()) + ")");
+                    
+                    // Update last publish time for this tracker
+                    last_tracker_publish_time[i] = currentTime;
+                }
+            }
+        }
+        // --- End new tracker publishing section ---
         
         // Reset controller update flags for the next iteration
         right_controller_updated = false;
         left_controller_updated = false;
         
         // Handle controller detection status
-        if (!anyControllerDetected) {
+        if (!anyControllerDetected &&!anyTrackerDetected) {
             if (std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastLogTime).count() >= VRInputConfig::LOG_INTERVAL_SECONDS) {
-                logMessage(Info, "No controllers detected, currentTime: " + 
+                logMessage(Info, "No controllers or trackers detected, currentTime: " + 
                         std::to_string(std::chrono::duration_cast<std::chrono::seconds>(currentTime.time_since_epoch()).count()));
                 
                 // Reset first_run flags for both controllers
                 first_run[VRInputConfig::RIGHT_CONTROLLER_INDEX] = true;
                 first_run[VRInputConfig::LEFT_CONTROLLER_INDEX] = true;
+
+                for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+                    first_tracker_run[i] = true;
+                }
                 
                 lastLogTime = currentTime; // Update the last log time
             }
@@ -341,6 +464,9 @@ void ViveInput::runVR() {
                 logMessage(Debug, "Right controller detected");
             } else if (controller_detected[VRInputConfig::LEFT_CONTROLLER_INDEX]) {
                 logMessage(Debug, "Left controller detected");
+            }
+            if (anyTrackerDetected) {
+                logMessage(Debug, "Trackers detected.");
             }
         }
     }
@@ -374,31 +500,31 @@ void ViveInput::processControllerButtons(uint32_t deviceIndex, vr::VRControllerS
     if ((1LL << vr::k_EButton_ApplicationMenu) & controllerState.ulButtonPressed) {
         logMessage(Debug, "Application Menu button pressed, resetting the pose");
         first_run[roleIndex] = true; // Reset the first run flag for this controller
-        local_data.menu_button = true;
+        local_controller_data.menu_button = true;
         VRUtils::HapticFeedback(pHMD, deviceIndex, VRInputConfig::HAPTIC_FEEDBACK_DURATION);
     }
     
     if ((1LL << vr::k_EButton_SteamVR_Trigger) & controllerState.ulButtonPressed) {
         logMessage(Debug, "Trigger button pressed");
-        local_data.trigger_button = true;
+        local_controller_data.trigger_button = true;
     }
     
     if ((1LL << vr::k_EButton_SteamVR_Touchpad) & controllerState.ulButtonPressed) {
         logMessage(Debug, "Touchpad button pressed");
-        local_data.trackpad_button = true;
+        local_controller_data.trackpad_button = true;
         VRUtils::HapticFeedback(pHMD, deviceIndex, VRInputConfig::HAPTIC_FEEDBACK_DURATION);
     }
     
     if ((1LL << vr::k_EButton_Grip) & controllerState.ulButtonPressed) {
         logMessage(Debug, "Grip button pressed");
-        local_data.grip_button = true;
+        local_controller_data.grip_button = true;
     }
     
     if ((1LL << vr::k_EButton_SteamVR_Touchpad) & controllerState.ulButtonTouched) {
         logMessage(Debug, "Touchpad button touched");
-        local_data.trackpad_x = controllerState.rAxis[0].x;
-        local_data.trackpad_y = controllerState.rAxis[0].y;
-        local_data.trackpad_touch = true;
+        local_controller_data.trackpad_x = controllerState.rAxis[0].x;
+        local_controller_data.trackpad_y = controllerState.rAxis[0].y;
+        local_controller_data.trackpad_touch = true;
     }
 }
 
@@ -408,7 +534,7 @@ void ViveInput::processTriggerFeedback(float triggerValue, uint32_t deviceIndex,
     const float stepSize = 1.0f / VRInputConfig::TRIGGER_FEEDBACK_STEPS;
     int currentStep = static_cast<int>(triggerValue / stepSize);
     logMessage(Debug, "Trigger: " + std::to_string(triggerValue) + "\n");
-    local_data.trigger = triggerValue;
+    local_controller_data.trigger = triggerValue;
     
     if (currentStep != previousStep[roleIndex]) {
         int vibrationDuration = static_cast<int>(triggerValue * VRInputConfig::TRIGGER_HAPTIC_MULTIPLIER);
@@ -417,38 +543,167 @@ void ViveInput::processTriggerFeedback(float triggerValue, uint32_t deviceIndex,
     }
 }
 
-bool ViveInput::validatePositionChange(const Eigen::Vector3d& currentPosition, int roleIndex) {
-    auto current_time = std::chrono::steady_clock::now();
-    if (!first_run[roleIndex]) {
-        std::chrono::duration<float> time_diff = current_time - prev_time[roleIndex];
-        float delta_time = time_diff.count();
-        
-        // Calculate position change using Eigen
-        Eigen::Vector3d position_change = currentPosition - prev_position[roleIndex];
-        double delta_distance = position_change.norm();
-        double velocity = delta_distance / delta_time;
+// New method to process data for generic trackers
+void ViveInput::processTrackerData(uint32_t deviceIndex) {
+    // Reset data for this specific tracker
+    tracker_data[deviceIndex].reset();
 
-        logMessage(Debug, "[CONTROLLER " + std::to_string(roleIndex) + "] Velocity: " + 
-                  std::to_string(velocity) + " units/s");
-        logMessage(Debug, "[CONTROLLER " + std::to_string(roleIndex) + "] Delta pos: " + 
-                  std::to_string(delta_distance) + " units");
-        
-        // Check if delta distance is reasonable using Eigen-based validation
-        if (!VRTransforms::isPositionChangeReasonable(currentPosition, prev_position[roleIndex], VRInputConfig::POSITION_THRESHOLD)) {
-            logMessage(Warning, "[CONTROLLER " + std::to_string(roleIndex) + 
-                      "] Unreasonable delta_distance detected: " + 
-                      std::to_string(delta_distance) + " units. Skipping this data.");
-            return false;
-        } else {
-            logMessage(Debug, "[CONTROLLER " + std::to_string(roleIndex) + "] Will publish this data");
-        }
-    } else {
-        first_run[roleIndex] = false; // Set the flag to false after the first run
+    // Store tracker data
+    tracker_data[deviceIndex].time = std::stoll(Server::getCurrentTimeWithMilliseconds()); // Convert string to long long
+    tracker_data[deviceIndex].device_index = deviceIndex;
+
+    // Get the pose of the device
+    vr::HmdMatrix34_t steamVRMatrix = trackedDevicePose[deviceIndex].mDeviceToAbsoluteTracking;
+    Eigen::Vector3d position = VRTransforms::getPositionFromVRMatrix(steamVRMatrix);
+    Eigen::Quaterniond quaternion = VRTransforms::getQuaternionFromVRMatrix(steamVRMatrix);
+
+    tracker_data[deviceIndex].position = position;
+    tracker_data[deviceIndex].quaternion = quaternion;
+
+    tracker_data[deviceIndex].linear_velocity = Eigen::Vector3d(
+        trackedDevicePose[deviceIndex].vVelocity.v[0],
+        trackedDevicePose[deviceIndex].vVelocity.v[1],
+        trackedDevicePose[deviceIndex].vVelocity.v[2]
+    );
+    tracker_data[deviceIndex].angular_velocity = Eigen::Vector3d(
+        trackedDevicePose[deviceIndex].vAngularVelocity.v[0],
+        trackedDevicePose[deviceIndex].vAngularVelocity.v[1],
+        trackedDevicePose[deviceIndex].vAngularVelocity.v[2]
+    );
+
+    tracker_data[deviceIndex].pose_is_valid = trackedDevicePose[deviceIndex].bPoseIsValid;
+    tracker_data[deviceIndex].device_is_connected = trackedDevicePose[deviceIndex].bDeviceIsConnected;
+
+    logMessage(Debug, ": " +
+            std::to_string(position.x() * 100) + " " +
+            std::to_string(position.y() * 100) + " " +
+            std::to_string(position.z() * 100));
+    logMessage(Debug, "[Linear Velocity]: " +
+            std::to_string(tracker_data[deviceIndex].linear_velocity.x()) + " " +
+            std::to_string(tracker_data[deviceIndex].linear_velocity.y()) + " " +
+            std::to_string(tracker_data[deviceIndex].linear_velocity.z()));
+    logMessage(Debug, "[Angular Velocity]: " +
+            std::to_string(tracker_data[deviceIndex].angular_velocity.x()) + " " +
+            std::to_string(tracker_data[deviceIndex].angular_velocity.y()) + " " +
+            std::to_string(tracker_data[deviceIndex].angular_velocity.z()));
+    logMessage(Debug,
+               std::string(" Pose Valid: ") +
+               (tracker_data[deviceIndex].pose_is_valid ? "True" : "False"));
+
+    // Validate position change for tracker
+    if (!validatePositionChange(position, deviceIndex, false)) { // false indicates it's a tracker
+        VRUtils::HapticFeedback(pHMD, deviceIndex, VRInputConfig::WARNING_HAPTIC_DURATION);
+        // If data is unreasonable, we skip updating prev_position/time for this frame to avoid
+        // propagating bad data, and we don't mark it as updated for publishing.
+        return;
+    }
+    // --- NEW: push tracker pose via the normal controller pipe ---
+    VRControllerData tracker_as_controller;
+    VRUtils::resetJsonData(tracker_as_controller);          // zero everything
+
+    tracker_as_controller.time = Server::getCurrentTimeWithMilliseconds();
+    tracker_as_controller.role = VRInputConfig::ROLE_TRACKER0;
+
+    /* pose (reuse helpers already used for controllers) */
+    tracker_as_controller.setPosition(position);            // no Y‑offset for tracker
+    tracker_as_controller.setQuaternion(quaternion);
+
+    // hand it off exactly like a controller
+    {
+        std::lock_guard<std::mutex> lk(data_mutex);
+        shared_data = tracker_as_controller;
+        data_cv.notify_one();
     }
 
-    // Update previous record
-    prev_position[roleIndex] = currentPosition;
-    prev_time[roleIndex] = current_time;
+    // Mark this tracker as updated for potential publishing
+    tracker_updated[deviceIndex] = true;
+
+    // Note on Tracker Buttons:
+    // The Vive Tracker 3.0 has a single button (power button) and pogo pin/USB inputs.
+    // These are NOT easily accessible via vr::IVRSystem::GetControllerState.
+    // To get input from a generic tracker, you would typically need to use the OpenVR Input system (IVRInput)
+    // with action manifests and bindings, which is a more complex setup.
+    // For this modification, we are focusing on pose data.
+}
+
+// Generalized position validation method for both controllers and trackers
+bool ViveInput::validatePositionChange(const Eigen::Vector3d& currentPosition,
+                                       uint32_t deviceIndex,
+                                       bool isController)
+{
+    const auto current_time = std::chrono::steady_clock::now();
+
+    // Select the right storage for controllers vs trackers
+    Eigen::Vector3d &prev_pos  = isController ?
+        prev_position[deviceIndex] : prev_tracker_position[deviceIndex];
+    std::chrono::steady_clock::time_point &prev_tp = isController ?
+        prev_time[deviceIndex] : prev_tracker_time[deviceIndex];
+
+    // First-sample flags
+    bool first_flag;
+    if (isController) {
+        if (deviceIndex >= VRInputConfig::MAX_CONTROLLERS) {
+            logMessage(Error, "Invalid controller role index: " + std::to_string(deviceIndex));
+            return false;
+        }
+        first_flag = first_run[deviceIndex];
+    } else {
+        if (deviceIndex >= first_tracker_run.size()) {
+            logMessage(Error, "Invalid tracker device index: " + std::to_string(deviceIndex));
+            return false;
+        }
+        first_flag = first_tracker_run[deviceIndex];
+    }
+
+    const char *device_type_str = isController ? "CONTROLLER" : "TRACKER";
+
+    if (!first_flag) {
+        // time delta
+        const std::chrono::duration<float> time_diff = current_time - prev_tp;
+        const float delta_time = time_diff.count();
+        if (delta_time <= 0.f) {
+            logMessage(Debug, std::string("[") + device_type_str +
+                               " " + std::to_string(deviceIndex) +
+                               "] Non-positive dt; skipping.");
+            // don't update prev_pos/prev_tp
+            return false;
+        }
+
+        // distance & velocity
+        const Eigen::Vector3d position_change = currentPosition - prev_pos;
+        const double delta_distance = position_change.norm();
+        const double velocity = delta_distance / delta_time;
+
+        logMessage(Debug, "[" + std::string(device_type_str) + " " + std::to_string(deviceIndex) +
+                          "] Velocity: " + std::to_string(velocity) + " units/s");
+        logMessage(Debug, "[" + std::string(device_type_str) + " " + std::to_string(deviceIndex) +
+                          "] Delta pos: " + std::to_string(delta_distance) + " units");
+
+        // sanity check
+        if (!VRTransforms::isPositionChangeReasonable(currentPosition,
+                                                      prev_pos,
+                                                      VRInputConfig::POSITION_THRESHOLD)) {
+            logMessage(Warning,
+                       "[" + std::string(device_type_str) + " " + std::to_string(deviceIndex) +
+                       "] Unreasonable delta_distance: " + std::to_string(delta_distance) +
+                       " units. Skipping this data.");
+            return false;
+        }
+        // OK to publish
+        logMessage(Debug, "[" + std::string(device_type_str) + " " + std::to_string(deviceIndex) +
+                          "] Will publish this data");
+    } else {
+        // consume first sample; next time we'll validate
+        if (isController) {
+            first_run[deviceIndex] = false;
+        } else {
+            first_tracker_run[deviceIndex] = false;
+        }
+    }
+
+    // update history (only if we didn't early-return)
+    prev_pos = currentPosition;
+    prev_tp  = current_time;
     return true;
 }
 

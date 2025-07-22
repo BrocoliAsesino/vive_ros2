@@ -15,6 +15,9 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include "vive_ros2/msg/vr_controller_data.hpp"
 
+#include <geometry_msgs/msg/pose_stamped.hpp>   // add this
+
+
 using json = nlohmann::json;
 
 // Constants for configuration
@@ -33,8 +36,9 @@ namespace VRConfig {
 
 // Controller role enumeration for better type safety
 enum class ControllerRole {
-    Right = VRConfig::RIGHT_CONTROLLER_ROLE,
-    Left = VRConfig::LEFT_CONTROLLER_ROLE
+    Right    = VRConfig::RIGHT_CONTROLLER_ROLE,
+    Left     = VRConfig::LEFT_CONTROLLER_ROLE,
+    Tracker0 = 2,
 };
 
 // Socket configuration parameter object
@@ -67,6 +71,11 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr right_abs_transform_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr right_rel_transform_publisher_;
 
+    // rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr tracker0_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr tracker_abs_transform_publisher_;
+
+    
+
     // Initialize socket address structure for TCP connection
     void setupSocket() {
         serv_addr.sin_family = AF_INET;
@@ -89,6 +98,12 @@ private:
         right_abs_transform_publisher_ = this->create_publisher<geometry_msgs::msg::TransformStamped>("right_vr/vive_pose_abs", VRConfig::DEFAULT_QUEUE_SIZE);
         right_rel_transform_publisher_ = this->create_publisher<geometry_msgs::msg::TransformStamped>("right_vr/vive_pose_rel", VRConfig::DEFAULT_QUEUE_SIZE);
         
+        // tracker0_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("/vive/tracker0", 10);
+        tracker_abs_transform_publisher_ =
+            this->create_publisher<geometry_msgs::msg::TransformStamped>("vive_tracker0_pose_abs",
+                                                               VRConfig::DEFAULT_QUEUE_SIZE);
+        
+
         RCLCPP_INFO(this->get_logger(), "Publishers created with role-based topic names.");
     }
 
@@ -282,6 +297,21 @@ public:
         RCLCPP_DEBUG(this->get_logger(), "Published controller data for %s controller", prefix.c_str());
     }
 
+    void publishTracker0(const VRControllerData &d)
+    {
+        /* 1. Build a TransformStamped, parent = world, child = vive_tracker0 */
+        geometry_msgs::msg::TransformStamped tf;
+        tf.header.stamp    = this->get_clock()->now();
+        tf.header.frame_id = "world";
+        tf.child_frame_id  = "vive_tracker0";
+
+        transformVRToROS(d, tf);              // reuse the same helper the controllers use
+
+        /* 2. Broadcast via TF and publish on its own topic */
+        tf_broadcaster_->sendTransform(tf);
+        tracker_abs_transform_publisher_->publish(tf);
+    }
+
     // Helper method to get a topic name based on controller role
     std::string getRoleBasedTopicName(int role, const std::string& baseTopic) {
         std::string prefix = (role == 1) ? "left_vr" : "right_vr";
@@ -408,6 +438,12 @@ public:
                             jsonData.menu_button, jsonData.trigger_button, 
                             jsonData.trackpad_button, jsonData.grip_button);
 
+                if (jsonData.role == static_cast<int>(ControllerRole::Tracker0)) {
+                    RCLCPP_INFO(this->get_logger(), "==================== ENTERING TRACKER0 HANDLING ====================");
+                    publishTracker0(jsonData);
+                    RCLCPP_INFO(this->get_logger(), "==================== EXITING TRACKER0 HANDLING =====================");
+                    continue;               // skip the normal controller flow
+                }
                 // Filter the pose data
                 VRControllerData filteredPose = filterPose(jsonData);
                 VRControllerData relativePose;
