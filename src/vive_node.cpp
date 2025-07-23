@@ -70,7 +70,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr right_rel_transform_publisher_;
 
     std::unordered_map<int, rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr> tracker_transform_pubs_;     // one publisher per tracker ID
-    bool last_msg_was_tracker_ = false; 
+    // bool last_msg_was_tracker_ = false; 
 
     // Initialize socket address structure for TCP connection
     void setupSocket() {
@@ -195,6 +195,7 @@ private:
     }
 
     VRControllerData filterPose(const VRControllerData& pose) {
+        if (pose.is_tracker){return pose;}        // <- add
         // Low-pass filter with controller-specific state tracking
         static VRControllerData prevPoseLeft;
         static VRControllerData prevPoseRight;
@@ -371,8 +372,9 @@ public:
             jsonData.role = j["role"];
             jsonData.time = j["time"];
             //NEW: Check if the device is a tracker
-            last_msg_was_tracker_ = (j.contains("device_type") &&
-                                   j["device_type"] == "tracker");
+            // last_msg_was_tracker_ = (j.contains("device_type") &&
+            //                        j["device_type"] == "tracker");
+            jsonData.is_tracker = j.value("is_tracker", false);
             return true;
         } catch (json::parse_error& e) {
             RCLCPP_ERROR(this->get_logger(), "JSON parse error: %s", e.what());
@@ -452,10 +454,10 @@ public:
                 if (!parseDeviceData(receivedData)) {
                     continue; // Skip this iteration if parsing failed
                 }
-                // if (last_msg_was_tracker_) {
-                //     publishTrackerTransform(jsonData);
-                //     continue;                         // skip controller code
-                // }
+                if (jsonData.is_tracker) {
+                    publishTrackerTransform(jsonData);   // abs TF + topic
+                    continue;                            // skip controller flow
+                }
 
                 // Log minimal information at INFO level
                 ControllerRole role = static_cast<ControllerRole>(jsonData.role);

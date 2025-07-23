@@ -171,6 +171,7 @@ void ViveInput::runVR() {
                         local_data.role = role_index; // 0 = right, 1 = left
                         local_data.setPosition(position - Eigen::Vector3d(0, VRInputConfig::Y_OFFSET, 0)); // Apply Y offset
                         local_data.setQuaternion(quaternion);
+                        local_data.is_tracker = false; // Mark as controller, not tracker
 
                         // Process controller state and buttons
                         vr::VRControllerState_t controllerState;
