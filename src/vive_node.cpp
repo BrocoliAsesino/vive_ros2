@@ -15,6 +15,8 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include "vive_ros2/msg/vr_controller_data.hpp"
 
+#include <unordered_map>  
+
 using json = nlohmann::json;
 
 // Constants for configuration
@@ -66,6 +68,9 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr left_rel_transform_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr right_abs_transform_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr right_rel_transform_publisher_;
+
+    std::unordered_map<int, rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr> tracker_transform_pubs_;     // one publisher per tracker ID
+    bool last_msg_was_tracker_ = false; 
 
     // Initialize socket address structure for TCP connection
     void setupSocket() {
@@ -282,6 +287,29 @@ public:
         RCLCPP_DEBUG(this->get_logger(), "Published controller data for %s controller", prefix.c_str());
     }
 
+    void publishTrackerTransform(const VRControllerData& data)
+    {
+        int id = data.role;                                // we used deviceIndex as role
+
+        // create publisher lazily
+        auto &pub = tracker_transform_pubs_[id];
+        if (!pub) {
+            const std::string topic =
+                "vive_tracker" + std::to_string(id) + "_pose_abs";
+            pub = this->create_publisher<geometry_msgs::msg::TransformStamped>(
+                topic, VRConfig::DEFAULT_QUEUE_SIZE);
+        }
+
+        geometry_msgs::msg::TransformStamped tf;
+        tf.header.stamp    = this->get_clock()->now();
+        tf.header.frame_id = "world";
+        tf.child_frame_id  = "vive_tracker" + std::to_string(id);
+
+        transformVRToROS(data, tf);        // reuse existing helper
+        tf_broadcaster_->sendTransform(tf);
+        pub->publish(tf);
+    }
+
     // Helper method to get a topic name based on controller role
     std::string getRoleBasedTopicName(int role, const std::string& baseTopic) {
         std::string prefix = (role == 1) ? "left_vr" : "right_vr";
@@ -314,6 +342,37 @@ public:
             jsonData.trigger = j["trigger"];
             jsonData.role = j["role"];
             jsonData.time = j["time"];
+            return true;
+        } catch (json::parse_error& e) {
+            RCLCPP_ERROR(this->get_logger(), "JSON parse error: %s", e.what());
+            return false;
+        }
+    }
+
+    bool parseDeviceData(const std::string& receivedData) {
+        try {
+            json j = json::parse(receivedData);
+            // Store JSON data to the struct
+            jsonData.pose_x = j["pose"]["x"];
+            jsonData.pose_y = j["pose"]["y"];
+            jsonData.pose_z = j["pose"]["z"];
+            jsonData.pose_qx = j["pose"]["qx"];
+            jsonData.pose_qy = j["pose"]["qy"];
+            jsonData.pose_qz = j["pose"]["qz"];
+            jsonData.pose_qw = j["pose"]["qw"];
+            jsonData.menu_button = j["buttons"]["menu"];
+            jsonData.trigger_button = j["buttons"]["trigger"];
+            jsonData.trackpad_touch = j["buttons"]["trackpad_touch"];
+            jsonData.trackpad_button = j["buttons"]["trackpad_button"];
+            jsonData.grip_button = j["buttons"]["grip"];
+            jsonData.trackpad_x = j["trackpad"]["x"];
+            jsonData.trackpad_y = j["trackpad"]["y"];
+            jsonData.trigger = j["trigger"];
+            jsonData.role = j["role"];
+            jsonData.time = j["time"];
+            //NEW: Check if the device is a tracker
+            last_msg_was_tracker_ = (j.contains("device_type") &&
+                                   j["device_type"] == "tracker");
             return true;
         } catch (json::parse_error& e) {
             RCLCPP_ERROR(this->get_logger(), "JSON parse error: %s", e.what());
@@ -390,9 +449,13 @@ public:
                 auto start_time = std::chrono::steady_clock::now();
                 
                 std::string receivedData(buffer, receivedByteCount);
-                if (!parseControllerData(receivedData)) {
+                if (!parseDeviceData(receivedData)) {
                     continue; // Skip this iteration if parsing failed
                 }
+                // if (last_msg_was_tracker_) {
+                //     publishTrackerTransform(jsonData);
+                //     continue;                         // skip controller code
+                // }
 
                 // Log minimal information at INFO level
                 ControllerRole role = static_cast<ControllerRole>(jsonData.role);

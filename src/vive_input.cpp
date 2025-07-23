@@ -48,6 +48,12 @@ private:
     std::condition_variable &data_cv;
     VRControllerData &shared_data;
     VRControllerData local_data;
+
+    // Trackers data
+    std::array<VRControllerData, vr::k_unMaxTrackedDeviceCount> tracker_data;
+    std::array<bool, vr::k_unMaxTrackedDeviceCount> tracker_updated;
+    std::array<std::chrono::steady_clock::time_point, vr::k_unMaxTrackedDeviceCount> last_publish_time_tracker;
+    std::array<bool, vr::k_unMaxTrackedDeviceCount> publish_time_initialized_tracker;
     
     // Track both controllers separately (right = 0, left = 1)
     bool controller_detected[VRInputConfig::MAX_CONTROLLERS] = {false, false};
@@ -127,6 +133,8 @@ void ViveInput::runVR() {
         for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
             if (trackedDevicePose[i].bDeviceIsConnected && trackedDevicePose[i].bPoseIsValid
                 && trackedDevicePose[i].eTrackingResult == vr::TrackingResult_Running_OK) {
+
+                vr::ETrackedDeviceClass trackedDeviceClass = pHMD->GetTrackedDeviceClass(i); 
 
                 if (VRUtils::controllerIsConnected(pHMD, i)) {
                     // Get the controller's role (left or right)
@@ -257,7 +265,26 @@ void ViveInput::runVR() {
                         }
                     }
                 }
+                else if (VRUtils::trackerIsConnected(pHMD, i)) {
+                    logMessage(Debug, "[TRACKER " + std::to_string(i) + "] is connected");
+                    // Process tracker data if needed
+                    vr::HmdMatrix34_t deviceMat = trackedDevicePose[i].mDeviceToAbsoluteTracking;
+                    Eigen::Vector3d pos = VRTransforms::getPositionFromVRMatrix(deviceMat);
+                    Eigen::Quaterniond quat = VRTransforms::getQuaternionFromVRMatrix(deviceMat);
+                    // Reset data structure and fill in tracker pose
+                    VRUtils::resetJsonData(local_data);
+                    local_data.time       = Server::getCurrentTimeWithMilliseconds();
+                    local_data.setPosition(pos - Eigen::Vector3d(0, VRInputConfig::Y_OFFSET, 0)); // apply same Y offset as controllers, if applicable
+                    local_data.setQuaternion(quat);
+                    local_data.role       = i;       // use device index (or a tracker ID) as identifier
+                    local_data.is_tracker = true;    // mark this data as tracker
+                    // Store this tracker's data for publishing
+                    tracker_data[i]   = local_data;
+                    tracker_updated[i] = true;
+
+                }
             }
+            
         }
 
         // Process and send controller data at controlled frequency
@@ -310,10 +337,38 @@ void ViveInput::runVR() {
                 }
             }
         }
+
+        // After sending controller data, handle tracker data publishing
+        for (uint32_t idx = 0; idx < vr::k_unMaxTrackedDeviceCount; ++idx) {
+            if (tracker_updated[idx]) {
+                // Initialize last publish time for this tracker if not done
+                if (!publish_time_initialized_tracker[idx]) {
+                    last_publish_time_tracker[idx] = currentTime;
+                    publish_time_initialized_tracker[idx] = true;
+                }
+                auto time_since_last = currentTime - last_publish_time_tracker[idx];
+                if (time_since_last >= interval_duration) {
+                    // Publish this tracker’s data
+                    {
+                        std::lock_guard<std::mutex> lock(data_mutex);
+                        shared_data = tracker_data[idx];               // copy tracker data into shared buffer
+                        shared_data.time = Server::getCurrentTimeWithMilliseconds();  // update timestamp to send time
+                        // shared_data.role is already set (device index or tracker ID)
+                        data_cv.notify_one();                          // notify server thread
+                    }
+                    last_publish_time_tracker[idx] = currentTime;       // update last publish time
+                    logMessage(Debug, "[TRACKER " + std::to_string(idx) + "] Data sent to server");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(VRInputConfig::CONTROLLER_DELAY_MS));
+                }
+            }
+        }
         
         // Reset controller update flags for the next iteration
         right_controller_updated = false;
         left_controller_updated = false;
+        for (uint32_t idx = 0; idx < vr::k_unMaxTrackedDeviceCount; ++idx) {
+            tracker_updated[idx] = false; // Reset tracker update flags
+        }
         
         // Handle controller detection status
         if (!anyControllerDetected) {

@@ -8,6 +8,7 @@ bool trackpad_button
 bool grip_button
 int8 role
 string time
+bool is_tracker
 
 # Pose data
 geometry_msgs/TransformStamped abs_pose

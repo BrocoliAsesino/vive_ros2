@@ -129,6 +129,7 @@ json Server::prepareData() {
     vrControllerMessage["trigger"] = shared_data.trigger;
     vrControllerMessage["role"] = shared_data.role;
     vrControllerMessage["time"] = shared_data.time;
+    vrControllerMessage["device_type"] = shared_data.is_tracker ? "tracker" : "controller";
     return vrControllerMessage;
 }
 

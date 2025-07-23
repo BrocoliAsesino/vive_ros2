@@ -27,7 +27,9 @@ struct VRControllerData {
     bool trackpad_touch = false;
     bool trackpad_button = false;
     bool grip_button = false;
-    
+    // NEW
+    bool is_tracker = false;
+
     // Analog inputs
     double trackpad_x = 0.0, trackpad_y = 0.0;
     double trigger = 0.0;
@@ -165,6 +167,14 @@ public:
     static bool controllerIsConnected(vr::IVRSystem* pHMD, vr::TrackedDeviceIndex_t unDeviceIndex) {
         if (!pHMD) return false;
         return pHMD->GetTrackedDeviceClass(unDeviceIndex) == vr::TrackedDeviceClass_Controller;
+    }
+
+    /**
+     * @brief Check if a device is a tracker
+     */
+    static bool trackerIsConnected(vr::IVRSystem* pHMD, vr::TrackedDeviceIndex_t unDeviceIndex) {
+        if (!pHMD) return false;
+        return pHMD->GetTrackedDeviceClass(unDeviceIndex) == vr::TrackedDeviceClass_GenericTracker;
     }
 
     /**
